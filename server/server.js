@@ -6,7 +6,7 @@ const morgan = require("morgan");
 const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
-
+const jwt = require("jsonwebtoken");
 const auth = require("./helper/auth");
 const { chatServices } = require("./api/v1/services/chat");
 const { messageServices } = require("./api/v1/services/message");
@@ -14,6 +14,11 @@ const { notificationServices } = require("./api/v1/services/notification");
 const DepositController = require("./api/v1/controllers/blockchain/deposit");
 const WithdrawCron = require("./cronJob/processAprrovedWithdrawals");
 const DepositCron = require("./cronJob/processConfirmedDeposits");
+const dotenv = require("dotenv");
+
+dotenv.config({path: './config.env'})
+
+
 
 class ExpressServer {
   constructor() {
@@ -73,6 +78,7 @@ class ExpressServer {
       try {
         if (token) {
           const user = await auth.verifyTokenBySocket(token);
+          console.log(user);
           if (user) {
             socket.userID = user._id;
             socket.userName = user.userName;
@@ -86,26 +92,88 @@ class ExpressServer {
     });
 
     global.NotifySocket = this.io.of("/notifications");
-    NotifySocket.on("connection", async (socket) => {
-      const user = socket.userID.toString();
-      socket.join(user);
+    
+    // NotifySocket.on("connection", async (socket) => {
+    //   const user = socket.userID.toString();
+    //   socket.join(user);
 
-      const unread = await notificationServices.notificationList({
-        userId: user,
-        status: { $ne: "DELETE" },
-        isRead: false,
-      });
+    //   const unread = await notificationServices.notificationList({
+    //     userId: user,
+    //     status: { $ne: "DELETE" },
+    //     isRead: false,
+    //   });
 
-      if (unread && unread.length > 0) {
-        NotifySocket.to(user).emit("notification", unread);
-      }
+    //   if (unread && unread.length > 0) {
+    //     NotifySocket.to(user).emit("notification", unread);
+    //   }
 
-      socket.on("error", (err) => {
-        console.error("Socket error:", err.message);
-        socket.disconnect();
-      });
+    //   socket.on("error", (err) => {
+    //     console.error("Socket error:", err.message);
+    //     socket.disconnect();
+    //   });
+    // });
+
+// Middleware to handle authentication
+  NotifySocket.use((socket, next) => {
+  // Extract token from handshake
+  const token = socket.handshake.auth.token;
+
+  if (!token) {
+    return next(new Error("Authentication error: token is missing"));
+  }
+
+  try {
+    // Replace 'your-secret-key' with your actual JWT secret
+    const decoded = jwt.verify(token, 'your-secret-key');
+
+    // Attach userID to socket object
+    socket.userID = decoded.id;
+    next();  // Proceed to connection handler
+  } catch (err) {
+    console.error("Invalid token:", err.message);
+    next(new Error("Authentication error: invalid token"));
+  }
+});
+
+
+   
+    
+    
+// Socket connection handler
+NotifySocket.on("connection", async (socket) => {
+  console.log("Socket connected with user ID:", socket.userID); // Log the user ID
+
+  // Ensure userID is available
+  if (!socket.userID) {
+    console.error("User ID is not defined, disconnecting socket.");
+    socket.disconnect();
+    return;
+  }
+
+  socket.join(socket.userID);  // Join the socket room based on user ID
+
+  try {
+    // Fetch unread notifications for the user
+    const unread = await notificationServices.notificationList({
+      userId: socket.userID, // Use socket's userID
+      status: { $ne: "DELETE" },
+      isRead: false,
     });
 
+    // Emit notifications to the specific user
+    if (unread && unread.length > 0) {
+      NotifySocket.to(socket.userID).emit("notification", unread);
+    }
+  } catch (error) {
+    console.error("Error fetching notifications:", error);
+  }
+
+  // Handle socket errors
+  socket.on("error", (err) => {
+    console.error("Socket error:", err.message);
+    socket.disconnect();
+  });
+});
     global.onlineUsers = new Map();
 
     this.io.on("connection", async (socket) => {
