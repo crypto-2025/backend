@@ -1,0 +1,184 @@
+const express = require("express");
+const mongoose = require("mongoose");
+const http = require("http");
+const { Server } = require("socket.io");
+const morgan = require("morgan");
+const cors = require("cors");
+const multer = require("multer");
+const path = require("path");
+
+const auth = require("./helper/auth");
+const { chatServices } = require("./api/v1/services/chat");
+const { messageServices } = require("./api/v1/services/message");
+const { notificationServices } = require("./api/v1/services/notification");
+const DepositController = require("./api/v1/controllers/blockchain/deposit");
+const WithdrawCron = require("./cronJob/processAprrovedWithdrawals");
+const DepositCron = require("./cronJob/processConfirmedDeposits");
+
+class ExpressServer {
+  constructor() {
+    this.app = express();
+    this.server = http.createServer(this.app);
+
+    // Initialize Socket.IO
+    this.io = new Server(this.server, {
+      cors: {
+        origin: "*",
+      },
+    });
+
+    this.configureServer();
+    this.configureSocket();
+  }
+
+  configureServer() {
+    // Middleware setup
+    this.app.use(express.json());
+    this.app.use(express.urlencoded({ extended: true }));
+    this.app.use(cors());
+    this.app.use(morgan("tiny"));
+    this.app.disable("etag");
+
+    // Serve static files (React build folder)
+    this.app.use(express.static(path.join(__dirname, "build")));
+
+    // Multer configuration for file uploads
+    const storage = multer.diskStorage({
+      destination: (req, file, cb) => {
+        cb(null, "uploads/");
+      },
+      filename: (req, file, cb) => {
+        cb(null, `${Date.now()}-${file.originalname}`);
+      },
+    });
+    this.upload = multer({ storage });
+
+    // Configure file upload routes
+    this.configureFileUpload("/upload/document1", "document1");
+    this.configureFileUpload("/upload/document2", "document2");
+    this.configureFileUpload("/uploadImage", "image");
+  }
+
+  configureFileUpload(endpoint, field) {
+    this.app.post(endpoint, this.upload.single(field), (req, res) => {
+      const uploadedFile = req.file;
+      console.log(`${field} uploaded:`, uploadedFile);
+      res.json({ message: `${field} uploaded successfully` });
+    });
+  }
+
+  configureSocket() {
+    this.io.use(async (socket, next) => {
+      const token = socket.handshake.auth.token;
+      try {
+        if (token) {
+          const user = await auth.verifyTokenBySocket(token);
+          if (user) {
+            socket.userID = user._id;
+            socket.userName = user.userName;
+            return next();
+          }
+        }
+        return next(new Error("Authentication error"));
+      } catch (err) {
+        return next(new Error("Unauthorized"));
+      }
+    });
+
+    global.NotifySocket = this.io.of("/notifications");
+    NotifySocket.on("connection", async (socket) => {
+      const user = socket.userID.toString();
+      socket.join(user);
+
+      const unread = await notificationServices.notificationList({
+        userId: user,
+        status: { $ne: "DELETE" },
+        isRead: false,
+      });
+
+      if (unread && unread.length > 0) {
+        NotifySocket.to(user).emit("notification", unread);
+      }
+
+      socket.on("error", (err) => {
+        console.error("Socket error:", err.message);
+        socket.disconnect();
+      });
+    });
+
+    global.onlineUsers = new Map();
+
+    this.io.on("connection", async (socket) => {
+      const user = socket.userID.toString();
+
+      if (onlineUsers.has(user)) {
+        onlineUsers.get(user).add(socket.id);
+      } else {
+        onlineUsers.set(user, new Set([socket.id]));
+        this.io.emit("notify", { onlineUsers: [...onlineUsers.keys()] });
+      }
+
+      const joinChats = await chatServices.chatList(socket.userID, {});
+      joinChats.forEach((chat) => socket.join(chat._id.toString()));
+
+      socket.on("sendMsg", async (data) => {
+        const chatId = data.chat_id.toString();
+        if (!socket.rooms.has(chatId)) {
+          socket.join(chatId);
+        }
+        const msg = await messageServices.createMsg({
+          chat: chatId,
+          sender: socket.userID,
+          text: data.message,
+          mediaType: data.mediaType || "text",
+        });
+        this.io.to(chatId).emit(chatId, msg);
+      });
+
+      socket.on("disconnect", () => {
+        onlineUsers.get(user)?.delete(socket.id);
+        if (onlineUsers.get(user)?.size === 0) {
+          onlineUsers.delete(user);
+          this.io.emit("notify", { onlineUsers: [...onlineUsers.keys()] });
+        }
+      });
+
+      socket.on("error", (err) => {
+        console.error("Socket error:", err.message);
+        socket.disconnect();
+      });
+    });
+  }
+
+  async configureDb(dbUrl) {
+    try {
+      await mongoose.connect(dbUrl, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+      });
+      console.log("MongoDB connection established");
+    } catch (error) {
+      console.error(`Error in MongoDB connection: ${error.message}`);
+      throw error;
+    }
+  }
+
+  router(routes) {
+    routes(this.app);
+    return this;
+  }
+
+  listen(port) {
+    this.server.listen(port, () => {
+      console.log(`App listening on port ${port} - ${new Date().toLocaleString()}`);
+    });
+  }
+
+  startCronJobs() {
+    WithdrawCron.start();
+    DepositCron.start();
+    DepositController.start();
+  }
+}
+
+module.exports = ExpressServer;
